@@ -290,8 +290,7 @@ async def process_messages(sender_id, sender_info, debounce):
                             if os.path.exists(pdf_path):
                                 await client.send_file(
                                     sender_id,
-                                    pdf_path,
-                                    caption="Virtus FX Club — Performance Report Dic 2025 / Apr 2026"
+                                    pdf_path
                                 )
                                 print(f"[STORICO] PDF inviato a {sender_info['full_name']}")
                             else:
