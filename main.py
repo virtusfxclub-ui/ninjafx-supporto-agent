@@ -685,8 +685,12 @@ async def handle_move_to_folder(request: web.Request) -> web.Response:
                 if folder_title in AUTO_MANAGED_FOLDERS and folder_title != target_folder_name:
                     new_peers = [p for p in f.include_peers if getattr(p, 'user_id', None) != chat_id]
                     if len(new_peers) != len(f.include_peers):
-                        f.include_peers = new_peers
-                        await client(UpdateDialogFilterRequest(id=f.id, filter=f))
+                        if len(new_peers) == 0:
+                            # Telegram non permette filtri con include_peers vuoto — skip update
+                            print(f"[FOLDER] Cartella '{folder_title}' sarebbe vuota dopo rimozione, skip update")
+                        else:
+                            f.include_peers = new_peers
+                            await client(UpdateDialogFilterRequest(id=f.id, filter=f))
 
                 if folder_title == target_folder_name:
                     target_filter = f
