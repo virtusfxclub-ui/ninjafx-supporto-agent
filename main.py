@@ -17,7 +17,7 @@ SESSION_STRING = os.environ.get("TELEGRAM_SESSION_STRING", "")
 TEST_MODE = os.environ.get("TEST_MODE", "false").lower() == "true"
 TEST_SENDER_ID = os.environ.get("TEST_SENDER_ID", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-TELEGRAM_BOT_TOKEN = "8502735249:AAHkiAgn25Lck0jUXuCiQUDS2oUGJyP9gbo"
+TELEGRAM_BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 PORT = int(os.environ.get("FOLLOWUP_SERVER_PORT", "8080"))
 
 DEBOUNCE_TEXT = 60
@@ -31,6 +31,8 @@ pending_messages = {}
 pending_tasks = {}
 paused_leads = set()
 agent_messages   = {}
+
+folder_lock = asyncio.Lock()  # previene race condition tra chiamate /move-to-folder simultanee
 
 
 def is_night_time():
@@ -573,7 +575,8 @@ async def handle_get_chats(request: web.Request) -> web.Response:
                     messages.append({
                         "sender": sender,
                         "text": msg.text,
-                        "time": msg.date.strftime("%H:%M")
+                        "time": msg.date.strftime("%H:%M"),
+                        "timestamp_iso": msg.date.isoformat()
                     })
             
             if messages:
@@ -590,11 +593,178 @@ async def handle_get_chats(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": str(e)}, status=500)
 
 
+async def get_dialog_filters():
+    """Recupera tutte le chat folders (dialog filters) dell'account"""
+    from telethon.tl.functions.messages import GetDialogFiltersRequest
+    result = await client(GetDialogFiltersRequest())
+    return result.filters
+
+
+async def handle_get_folder_status(request: web.Request) -> web.Response:
+    """
+    GET /folder-status
+    Restituisce per ogni chat privata: nome contatto, chat_id, e in quale cartella si trova
+    """
+    try:
+        filters = await get_dialog_filters()
+        folder_map = {}  # chat_id -> folder_title
+        folder_ids = {}  # folder_title -> folder_id
+
+        for f in filters:
+            if hasattr(f, 'title') and hasattr(f, 'id') and hasattr(f, 'include_peers'):
+                folder_title = f.title.text if hasattr(f.title, 'text') else str(f.title)
+                folder_title = folder_title.strip()
+                folder_ids[folder_title] = f.id
+                for peer in f.include_peers:
+                    peer_id = getattr(peer, 'user_id', None) or getattr(peer, 'channel_id', None) or getattr(peer, 'chat_id', None)
+                    if peer_id:
+                        folder_map[str(peer_id)] = folder_title
+
+        chats_data = []
+        cutoff_30d = datetime.now(ITALY_TZ).timestamp() - (30 * 24 * 3600)
+        async for dialog in client.iter_dialogs(limit=200):
+            if not dialog.is_user:
+                continue
+            if dialog.entity.bot:
+                continue
+            me = await client.get_me()
+            if dialog.entity.id == me.id:
+                continue
+            if dialog.date and dialog.date.timestamp() < cutoff_30d:
+                continue
+
+            chat_id = str(dialog.entity.id)
+            full_name = f"{dialog.entity.first_name or ''} {dialog.entity.last_name or ''}".strip()
+            current_folder = folder_map.get(chat_id, "Nessuna cartella")
+
+            chats_data.append({
+                "chat_id": chat_id,
+                "nome": full_name,
+                "cartella_attuale": current_folder
+            })
+
+        return web.json_response({"ok": True, "chats": chats_data, "folder_ids": folder_ids})
+
+    except Exception as e:
+        print(f"[FOLDER-STATUS ERROR] {e}")
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+
+async def handle_move_to_folder(request: web.Request) -> web.Response:
+    """
+    POST /move-to-folder
+    Body: {"chat_id": "123456", "folder_name": "Trattativa"}
+    Sposta una chat nella cartella specificata (la rimuove dalle altre cartelle auto-gestite)
+    """
+    try:
+        from telethon.tl.functions.messages import UpdateDialogFilterRequest
+
+        data = await request.json()
+        chat_id = int(data.get("chat_id"))
+        target_folder_name = data.get("folder_name", "").strip()
+
+        if not target_folder_name:
+            return web.json_response({"ok": False, "error": "folder_name mancante"}, status=400)
+
+        async with folder_lock:
+            entity = await client.get_entity(chat_id)
+            input_peer = await client.get_input_entity(entity)
+
+            filters = await get_dialog_filters()
+
+            AUTO_MANAGED_FOLDERS = ["Trattativa", "Contattare", "Perso"]
+
+            target_filter = None
+            for f in filters:
+                if not (hasattr(f, 'title') and hasattr(f, 'id') and hasattr(f, 'include_peers')):
+                    continue
+
+                folder_title = f.title.text if hasattr(f.title, 'text') else str(f.title)
+                folder_title = folder_title.strip()
+
+                if folder_title in AUTO_MANAGED_FOLDERS and folder_title != target_folder_name:
+                    new_peers = [p for p in f.include_peers if getattr(p, 'user_id', None) != chat_id]
+                    if len(new_peers) != len(f.include_peers):
+                        f.include_peers = new_peers
+                        await client(UpdateDialogFilterRequest(id=f.id, filter=f))
+
+                if folder_title == target_folder_name:
+                    target_filter = f
+
+            if target_filter is None:
+                return web.json_response({"ok": False, "error": f"Cartella '{target_folder_name}' non trovata"}, status=404)
+
+            already_in = any(getattr(p, 'user_id', None) == chat_id for p in target_filter.include_peers)
+            if not already_in:
+                target_filter.include_peers.append(input_peer)
+                await client(UpdateDialogFilterRequest(id=target_filter.id, filter=target_filter))
+
+            print(f"[FOLDER] Chat {chat_id} spostata in '{target_folder_name}'")
+            return web.json_response({"ok": True, "moved_to": target_folder_name})
+
+    except Exception as e:
+        print(f"[MOVE-FOLDER ERROR] {e}")
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+
+async def handle_get_single_chat(request: web.Request) -> web.Response:
+    """
+    GET /get-single-chat?chat_id=123456&hours=72
+    Restituisce SOLO la chat specificata, senza scansionare tutti i dialoghi.
+    Molto più veloce di /get-chats quando serve una sola chat.
+    """
+    try:
+        chat_id_str = request.rel_url.query.get("chat_id", "")
+        if not chat_id_str:
+            return web.json_response({"ok": False, "error": "chat_id mancante"}, status=400)
+
+        chat_id = int(chat_id_str)
+        hours = int(request.rel_url.query.get("hours", "72"))
+        cutoff = datetime.now(ITALY_TZ).timestamp() - (hours * 3600)
+
+        entity = await client.get_entity(chat_id)
+        chat_agent_msgs = agent_messages.get(chat_id, [])
+
+        messages = []
+        async for msg in client.iter_messages(entity, limit=5):
+            if not msg.date or msg.date.timestamp() < cutoff:
+                break
+            if msg.text:
+                if msg.out:
+                    is_agent = msg.text.strip() in chat_agent_msgs
+                    sender = "Agent" if is_agent else "Lorenzo (manuale)"
+                else:
+                    sender = getattr(entity, 'first_name', None) or "Lead"
+                messages.append({
+                    "sender": sender,
+                    "text": msg.text,
+                    "time": msg.date.strftime("%H:%M"),
+                    "timestamp_iso": msg.date.isoformat()
+                })
+
+        messages.reverse()
+        full_name = f"{getattr(entity, 'first_name', '') or ''} {getattr(entity, 'last_name', '') or ''}".strip()
+
+        return web.json_response({
+            "ok": True,
+            "chat_id": str(chat_id),
+            "nome": full_name,
+            "messaggi": messages
+        })
+
+    except Exception as e:
+        print(f"[GET-SINGLE-CHAT ERROR] {e}")
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+
 async def start_http_server():
     app = web.Application()
-    app.router.add_post("/send-followup", handle_send_followup)
-    app.router.add_get("/health",         handle_healthcheck)
-    app.router.add_get("/get-chats",      handle_get_chats)
+    app.router.add_post("/send-followup",  handle_send_followup)
+    app.router.add_get("/health",          handle_healthcheck)
+    app.router.add_get("/get-chats",       handle_get_chats)
+    app.router.add_get("/get-single-chat", handle_get_single_chat)
+    app.router.add_get("/folder-status",   handle_get_folder_status)
+    app.router.add_post("/move-to-folder", handle_move_to_folder)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
